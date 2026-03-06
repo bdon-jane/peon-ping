@@ -179,6 +179,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 
 PEON_DIR = os.path.realpath(sys.argv[1])
@@ -188,6 +189,10 @@ PORT = int(sys.argv[4])
 
 CONFIG_FILE = os.path.join(PEON_DIR, "config.json")
 STATE_FILE = os.path.join(PEON_DIR, ".state.json")
+REMOTE_STATE_FILE = os.path.join(PEON_DIR, ".remote_state.json")
+
+active_sessions = {}  # session_id → time.time() when UserPromptSubmit received
+SESSION_KEEPALIVE_S = 600  # safety timeout
 
 # Build list of allowed path prefixes (PEON_DIR + any symlink targets within it)
 ALLOWED_PREFIXES = [PEON_DIR + os.sep]
@@ -443,6 +448,18 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"OK")
             return
 
+        if parsed.path == "/state":
+            try:
+                with open(REMOTE_STATE_FILE) as f:
+                    data = f.read()
+            except FileNotFoundError:
+                data = "{}"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(data.encode())
+            return
+
         if parsed.path != "/play":
             self.send_error(404)
             return
@@ -502,6 +519,65 @@ class RelayHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/state":
+            length = int(self.headers.get("Content-Length", 0))
+            if length > 0:
+                try:
+                    body = json.loads(self.rfile.read(length))
+                except (json.JSONDecodeError, ValueError):
+                    self.send_error(400, "Invalid JSON")
+                    return
+            else:
+                self.send_error(400, "Missing body")
+                return
+            last_active = body.get("last_active")
+            if not isinstance(last_active, dict) or "timestamp" not in last_active:
+                self.send_error(400, "Invalid last_active")
+                return
+            state = {}
+            try:
+                with open(REMOTE_STATE_FILE) as f:
+                    state = json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                pass
+            session_id = last_active.get("session_id", "")
+            if not session_id:
+                self.send_error(400, "Missing session_id in last_active")
+                return
+            sessions = state.get("sessions", {})
+            event_name = last_active.get("event", "")
+            now = time.time()
+
+            # Keepalive: refresh timestamps for parent sessions still processing
+            for sid in list(active_sessions):
+                if now - active_sessions[sid] < SESSION_KEEPALIVE_S:
+                    if sid in sessions:
+                        sessions[sid] = {**sessions[sid], "timestamp": now}
+                else:
+                    del active_sessions[sid]  # safety expire
+
+            # Track active sessions
+            if event_name == "UserPromptSubmit":
+                active_sessions[session_id] = now
+            elif event_name in ("Stop", "SessionEnd"):
+                active_sessions.pop(session_id, None)
+
+            if last_active.get("event") == "SessionEnd":
+                sessions.pop(session_id, None)
+            else:
+                sessions[session_id] = last_active
+            # Prune sessions inactive for more than 10 min
+            sessions = {sid: s for sid, s in sessions.items() if now - s.get("timestamp", 0) < 600}
+            state["sessions"] = sessions
+            tmp = REMOTE_STATE_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, REMOTE_STATE_FILE)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            self.wfile.write(b"OK")
+            return
         if parsed.path != "/notify":
             self.send_error(404)
             return
